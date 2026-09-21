@@ -1,0 +1,445 @@
+#!/usr/bin/env bash
+# aws-oidc-login: set up AWS CLI v2 profiles for every account in an
+# AWS IAM Identity Center (SSO) portal, using only the official CLI.
+#
+# Works with the macOS system bash (3.2) as well as bash 4/5.
+set -euo pipefail
+
+VERSION="1.0.0"
+
+# Defaults: Harvard University (HUIT) AWS access portal. Override with flags.
+DEFAULT_SESSION="huit"
+DEFAULT_START_URL="https://huitprodpayer.awsapps.com/start"
+DEFAULT_SSO_REGION="us-east-1"
+DEFAULT_ROLE_PREFERENCE="HUITDevOpsAdmin,HUITGenAdmin,HUITPowerUser,HUITReadOnly"
+
+CONFIG="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
+CREDENTIALS="${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}"
+CACHE_DIR="$HOME/.aws/sso/cache"
+
+session="$DEFAULT_SESSION"
+start_url=""
+sso_region=""
+profile_region=""
+prefix=""
+all_roles=0
+assume_yes=0
+dry_run=0
+verify=1
+role_preference="${ROLE_PREFERENCE:-$DEFAULT_ROLE_PREFERENCE}"
+
+usage() {
+  cat <<EOF
+aws-oidc-login $VERSION: AWS CLI profiles for every IAM Identity Center account
+
+Usage: aws-oidc-login [command] [options]
+
+Commands:
+  setup      Configure the sso-session, log in, and add a profile for every
+             account you can access (default command)
+  login      Log in (or refresh) the sso-session
+  list       Show every account and role you can access
+  generate   Print profile blocks to stdout without changing anything
+  verify     Call sts get-caller-identity on every profile of the session
+
+Options:
+  -s, --session NAME     sso-session name (default: $DEFAULT_SESSION)
+  -u, --start-url URL    access portal URL (default: $DEFAULT_START_URL)
+  -r, --sso-region REG   Identity Center region (default: $DEFAULT_SSO_REGION)
+      --region REG       region written into each profile (default: sso region)
+  -p, --prefix PREFIX    prepend PREFIX to every new profile name
+      --all-roles        one profile per account+role (<account>-<role>)
+      --dry-run          show what setup would change, write nothing
+      --no-verify        skip the verification step after setup
+  -y, --yes              apply without asking
+  -h, --help             show this help
+  -V, --version          show version
+
+Environment:
+  ROLE_PREFERENCE        comma list of role names, most preferred first
+                         (default: $DEFAULT_ROLE_PREFERENCE)
+  AWS_CONFIG_FILE        config file to edit (default: ~/.aws/config)
+EOF
+}
+
+die()  { echo "error: $*" >&2; exit 1; }
+info() { echo "$*" >&2; }
+
+# ---------- small helpers ----------
+
+sha1() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum | cut -d' ' -f1
+  else
+    printf '%s' "$1" | sha1sum | cut -d' ' -f1
+  fi
+}
+
+slug() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
+
+# ini_has FILE SECTION: true if [SECTION] exists (whitespace-tolerant)
+ini_has() {
+  [[ -f "$1" ]] || return 1
+  awk -v s="[$2]" '{ l=$0; gsub(/^[ \t]+|[ \t]+$/, "", l) } l==s { found=1; exit } END { exit !found }' "$1"
+}
+
+# ini_get FILE SECTION KEY: print the value of KEY in [SECTION]
+ini_get() {
+  [[ -f "$1" ]] || return 0
+  awk -v s="[$2]" -v k="$3" '
+    { l=$0; gsub(/^[ \t]+|[ \t]+$/, "", l) }
+    l==s { f=1; next }
+    l ~ /^\[/ { f=0 }
+    f && index(l, "=") {
+      key=substr(l, 1, index(l, "=")-1); gsub(/[ \t]+/, "", key)
+      if (key==k) { v=substr(l, index(l, "=")+1); gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit }
+    }' "$1"
+}
+
+config_section() {  # profile name -> config section header
+  if [[ "$1" == "default" ]]; then echo "default"; else echo "profile $1"; fi
+}
+
+backup_config() {
+  [[ -f "$CONFIG" ]] || return 0
+  local b; b="$CONFIG.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -p "$CONFIG" "$b"
+  info "Backed up $CONFIG -> $b"
+}
+
+require_tools() {
+  command -v aws >/dev/null 2>&1 || die "aws CLI not found (install AWS CLI v2)"
+  command -v jq  >/dev/null 2>&1 || die "jq not found (brew install jq / apt install jq)"
+  aws --version 2>&1 | grep -q '^aws-cli/2\.' || die "AWS CLI v2 is required ($(aws --version 2>&1))"
+}
+
+# ---------- sso-session ----------
+
+ensure_session() {
+  if ini_has "$CONFIG" "sso-session $session"; then
+    local existing; existing=$(ini_get "$CONFIG" "sso-session $session" sso_start_url)
+    if [[ -n "$start_url" && "$existing" != "$start_url" ]]; then
+      die "[sso-session $session] already points at $existing; use --session to pick another name"
+    fi
+    sso_region=$(ini_get "$CONFIG" "sso-session $session" sso_region)
+    [[ -n "$sso_region" ]] || die "[sso-session $session] has no sso_region"
+    return 0
+  fi
+  start_url="${start_url:-$DEFAULT_START_URL}"
+  sso_region="${sso_region:-$DEFAULT_SSO_REGION}"
+  if (( dry_run )); then
+    info "Would add [sso-session $session] -> $start_url ($sso_region)"
+    return 0
+  fi
+  mkdir -p "$(dirname "$CONFIG")"
+  backup_config
+  printf '\n[sso-session %s]\nsso_start_url = %s\nsso_region = %s\nsso_registration_scopes = sso:account:access\n' \
+    "$session" "$start_url" "$sso_region" >> "$CONFIG"
+  info "Added [sso-session $session] -> $start_url ($sso_region)"
+}
+
+load_session() {
+  ini_has "$CONFIG" "sso-session $session" \
+    || die "no [sso-session $session] in $CONFIG; run: aws-oidc-login setup"
+  sso_region=$(ini_get "$CONFIG" "sso-session $session" sso_region)
+  [[ -n "$sso_region" ]] || die "[sso-session $session] has no sso_region"
+}
+
+# ---------- token ----------
+
+access_token() {
+  local f; f="$CACHE_DIR/$(sha1 "$session").json"
+  [[ -f "$f" ]] && jq -r '.accessToken // empty' "$f" 2>/dev/null || true
+}
+
+token_works() {
+  local t; t=$(access_token)
+  [[ -n "$t" ]] && aws sso list-accounts --access-token "$t" --region "$sso_region" \
+                     --max-items 1 >/dev/null 2>&1
+}
+
+# The cached access token lasts about an hour; the CLI refreshes it silently
+# whenever a profile that uses the session is called. Try that before a login.
+refresh_token() {
+  local p
+  p=$(session_profiles | head -n1)
+  [[ -n "$p" ]] && aws sts get-caller-identity --profile "$p" >/dev/null 2>&1 || true
+}
+
+ensure_token() {
+  token_works && return 0
+  refresh_token
+  token_works && return 0
+  if [[ "${1:-}" == "login" ]]; then
+    info "Opening a browser to log in to $session..."
+    aws sso login --sso-session "$session"
+    token_works || die "login did not produce a usable token"
+  else
+    die "not logged in; run: aws sso login --sso-session $session"
+  fi
+}
+
+# ---------- accounts / plan ----------
+
+# rows: account_id <TAB> account_name <TAB> role   (one row per role)
+account_roles() {
+  local t; t=$(access_token)
+  aws sso list-accounts --access-token "$t" --region "$sso_region" --output json \
+    | jq -r '.accountList[] | [.accountId, .accountName] | @tsv' \
+    | sort -t "$(printf '\t')" -k2 -f \
+    | while IFS="$(printf '\t')" read -r id name; do
+        aws sso list-account-roles --access-token "$t" --region "$sso_region" \
+            --account-id "$id" --output json \
+          | jq -r --arg id "$id" --arg n "$name" '.roleList[] | [$id, $n, .roleName] | @tsv'
+      done
+}
+
+pick_role() {  # stdin: role names; prints the preferred one
+  local roles p
+  roles=$(sort)
+  for p in $(printf '%s' "$role_preference" | tr ',' ' '); do
+    if printf '%s\n' "$roles" | grep -qxF "$p"; then echo "$p"; return; fi
+  done
+  printf '%s\n' "$roles" | head -n1
+}
+
+# plan rows: profile <TAB> account_id <TAB> role <TAB> account_name
+plan() {
+  local rows ids id name role base seen="" tab
+  tab="$(printf '\t')"
+  rows=$(account_roles)
+  [[ -n "$rows" ]] || die "no accounts are assigned to you in this portal"
+  ids=$(printf '%s\n' "$rows" | cut -f1 | awk '!s[$0]++')
+  for id in $ids; do
+    name=$(printf '%s\n' "$rows" | awk -F'\t' -v i="$id" '$1==i {print $2; exit}')
+    base="${prefix}$(slug "$name")"
+    [[ -n "$base" ]] || base="${prefix}account-$id"
+    if printf '%s\n' "$seen" | grep -qxF "$base"; then base="$base-$id"; fi
+    seen="$seen"$'\n'"$base"
+    if (( all_roles )); then
+      printf '%s\n' "$rows" | awk -F'\t' -v i="$id" '$1==i {print $3}' | while read -r role; do
+        printf '%s%s%s%s%s%s%s\n' "$base-$(slug "$role")" "$tab" "$id" "$tab" "$role" "$tab" "$name"
+      done
+    else
+      role=$(printf '%s\n' "$rows" | awk -F'\t' -v i="$id" '$1==i {print $3}' | pick_role)
+      printf '%s%s%s%s%s%s%s\n' "$base" "$tab" "$id" "$tab" "$role" "$tab" "$name"
+    fi
+  done
+}
+
+# classify NAME ACCOUNT ROLE -> add | merge | exists | rename
+#   add     no profile by that name; append a new block
+#   merge   [profile NAME] exists with only plain settings (region, output...)
+#           and no long-lived key; insert the sso_* keys into it
+#   exists  already an SSO profile for this account and role
+#   rename  the name belongs to something else (long-lived IAM key, assume-role,
+#           another SSO account...); use NAME-sso instead
+classify() {
+  local name="$1" acct="$2" role="$3" sec keyid k
+  if [[ -n "$(profile_for "$acct" "$role")" ]]; then echo exists; return; fi
+  sec=$(config_section "$name")
+  keyid=$(ini_get "$CREDENTIALS" "$name" aws_access_key_id)
+  if ini_has "$CONFIG" "$sec"; then
+    if [[ "$(ini_get "$CONFIG" "$sec" sso_account_id)" == "$acct" &&
+          "$(ini_get "$CONFIG" "$sec" sso_role_name)" == "$role" ]]; then
+      echo exists; return
+    fi
+  fi
+  case "$keyid" in AKIA*) echo rename; return ;; esac
+  if ini_has "$CONFIG" "$sec"; then
+    for k in sso_session sso_start_url sso_account_id role_arn source_profile \
+             credential_source credential_process web_identity_token_file \
+             aws_access_key_id; do
+      [[ -n "$(ini_get "$CONFIG" "$sec" "$k")" ]] && { echo rename; return; }
+    done
+    echo merge; return
+  fi
+  echo add
+}
+
+# profile_for ACCOUNT ROLE: name of an existing profile (any name) that already
+# uses this session for this account and role
+profile_for() {
+  [[ -f "$CONFIG" ]] || return 0
+  awk -v s="$session" -v a="$1" -v r="$2" '
+    function flush() { if (p != "" && ss == s && aa == a && rr == r) { print p; found=1 } }
+    { l=$0; gsub(/^[ \t]+|[ \t]+$/, "", l) }
+    l ~ /^\[/ { flush(); if (found) exit
+                p=""; ss=""; aa=""; rr=""
+                if (l ~ /^\[profile /) p=substr(l, 10, length(l)-10); else if (l=="[default]") p="default"
+                next }
+    index(l, "=") { k=substr(l, 1, index(l, "=")-1); gsub(/[ \t]+/, "", k)
+                    v=substr(l, index(l, "=")+1); gsub(/^[ \t]+/, "", v)
+                    if (k=="sso_session") ss=v; else if (k=="sso_account_id") aa=v; else if (k=="sso_role_name") rr=v }
+    END { if (!found) flush() }' "$CONFIG"
+}
+
+# resolve: plan rows -> action <TAB> profile <TAB> account <TAB> role <TAB> account_name <TAB> note
+resolve() {
+  local name acct role aname action note tab
+  tab="$(printf '\t')"
+  while IFS="$tab" read -r name acct role aname; do
+    action=$(classify "$name" "$acct" "$role")
+    note=""
+    if [[ "$action" == "exists" ]]; then
+      name=$(profile_for "$acct" "$role"); printf '%s\n' "exists$tab$name$tab$acct$tab$role$tab$aname$tab"; continue
+    fi
+    if [[ "$action" == "rename" ]]; then
+      note="'$name' is already used by something else"
+      name="$name-sso"
+      action=$(classify "$name" "$acct" "$role")
+      [[ "$action" == "rename" ]] && action="skip" && note="'$name' is also taken"
+    fi
+    if [[ "$action" != "skip" && -z "$note" ]]; then
+      case "$(ini_get "$CREDENTIALS" "$name" aws_access_key_id)" in
+        ASIA*) note="SSO will take priority over temporary keys in credentials" ;;
+      esac
+    fi
+    printf '%s\n' "$action$tab$name$tab$acct$tab$role$tab$aname$tab$note"
+  done
+}
+
+profile_block() {  # name account role [skip_region]
+  printf 'sso_session = %s\nsso_account_id = %s\nsso_role_name = %s\n' "$session" "$2" "$3"
+  [[ "${4:-}" == "skip_region" ]] || printf 'region = %s\noutput = json\n' "${profile_region:-$sso_region}"
+}
+
+apply_plan() {  # stdin: resolved rows
+  local rows tab tmp action name acct role aname note sec
+  tab="$(printf '\t')"
+  rows=$(cat)
+  backup_config
+  printf '\n# --- aws-oidc-login: sso-session %s (%s) ---\n' "$session" "$(date +%Y-%m-%d)" >> "$CONFIG"
+  while IFS="$tab" read -r action name acct role aname note; do
+    sec=$(config_section "$name")
+    case "$action" in
+      add)
+        { printf '\n[%s]\n' "$sec"; profile_block "$name" "$acct" "$role"; } >> "$CONFIG" ;;
+      merge)
+        local extra="" block
+        [[ -n "$(ini_get "$CONFIG" "$sec" region)" ]] && extra="skip_region"
+        block=$(profile_block "$name" "$acct" "$role" $extra)
+        tmp=$(mktemp "${CONFIG}.XXXXXX")
+        BLOCK="$block" awk -v s="[$sec]" '
+          { print; l=$0; gsub(/^[ \t]+|[ \t]+$/, "", l) }
+          l==s && !done { print ENVIRON["BLOCK"]; done=1 }' "$CONFIG" > "$tmp"
+        cat "$tmp" > "$CONFIG" && rm -f "$tmp" ;;
+    esac
+  done <<EOF
+$rows
+EOF
+}
+
+print_plan() {  # stdin: resolved rows
+  awk -F'\t' '
+    { n[$1]++; printf "  %-7s %-40s %s  %s%s\n", $1, $2, $3, $4, ($6 != "" ? "  (" $6 ")" : "") }
+    END { printf "\n  %d add, %d merge, %d already set up, %d skipped\n", n["add"], n["merge"], n["exists"], n["skip"] }' >&2
+}
+
+session_profiles() {
+  [[ -f "$CONFIG" ]] || return 0
+  awk -v s="$session" '
+    { l=$0; gsub(/^[ \t]+|[ \t]+$/, "", l) }
+    l ~ /^\[/ { p=""; if (l ~ /^\[profile /) { p=substr(l, 10, length(l)-10) } else if (l=="[default]") { p="default" } next }
+    p!="" && l ~ /^sso_session[ \t]*=/ { v=l; sub(/^[^=]*=[ \t]*/, "", v); if (v==s) print p }' "$CONFIG"
+}
+
+# ---------- commands ----------
+
+cmd_login() {
+  require_tools
+  load_session
+  ensure_token login
+  info "Logged in to $session."
+}
+
+cmd_list() {
+  require_tools
+  load_session
+  ensure_token
+  account_roles | awk -F'\t' '{ printf "%-14s %-40s %s\n", $1, $2, $3 }'
+}
+
+cmd_generate() {
+  require_tools
+  load_session
+  ensure_token
+  local tab name acct role aname
+  tab="$(printf '\t')"
+  plan | while IFS="$tab" read -r name acct role aname; do
+    printf '\n# %s\n[%s]\n' "$aname" "$(config_section "$name")"
+    profile_block "$name" "$acct" "$role"
+  done
+}
+
+cmd_verify() {
+  require_tools
+  load_session
+  ensure_token
+  local profiles out
+  profiles=$(session_profiles)
+  [[ -n "$profiles" ]] || die "no profiles use sso-session $session"
+  # shellcheck disable=SC2016  # $1/$r expand inside the sh -c child
+  out=$(printf '%s\n' "$profiles" | xargs -P 8 -I{} sh -c '
+      r=$(aws sts get-caller-identity --profile "$1" --query Arn --output text 2>&1 | tail -n1)
+      printf "%s\t%s\n" "$1" "$r"' _ {} | sort)
+  printf '%s\n' "$out" | awk -F'\t' '
+    { ok = ($2 ~ /^arn:aws:sts::/)
+      if (ok) { split($2, a, ":"); r=$2; sub(/.*assumed-role\/(AWSReservedSSO_)?/, "", r); sub(/_[0-9a-f]+\/.*/, "", r)
+                printf "  ok    %-40s %s  %s\n", $1, a[5], r; good++ }
+      else    { printf "  FAIL  %-40s %s\n", $1, $2; bad++ } }
+    END { printf "\n  %d ok, %d failed\n", good, bad; exit (bad > 0) }'
+}
+
+cmd_setup() {
+  require_tools
+  ensure_session
+  if (( dry_run )) && ! ini_has "$CONFIG" "sso-session $session"; then
+    info "Dry run: log in and re-run to see the profile plan."
+    return 0
+  fi
+  ensure_token login
+  info "Reading accounts and roles from $session..."
+  local resolved changes
+  resolved=$(plan | resolve)
+  printf '%s\n' "$resolved" | print_plan
+  changes=$(printf '%s\n' "$resolved" | awk -F'\t' '$1=="add" || $1=="merge"' | wc -l | tr -d ' ')
+  if (( dry_run )); then info "Dry run: nothing written."; return 0; fi
+  if [[ "$changes" == "0" ]]; then info "Nothing to change."; else
+    if (( ! assume_yes )); then
+      printf 'Apply these changes to %s? [y/N] ' "$CONFIG" >&2
+      local ans; read -r ans </dev/tty || ans=""
+      [[ "$ans" == [yY]* ]] || { info "Aborted; nothing written."; return 1; }
+    fi
+    printf '%s\n' "$resolved" | apply_plan
+    info "Wrote $changes profile(s) to $CONFIG."
+  fi
+  if (( verify )); then info ""; info "Verifying..."; cmd_verify; fi
+}
+
+# ---------- argument parsing ----------
+
+command="setup"
+case "${1:-}" in
+  setup|login|list|generate|verify) command="$1"; shift ;;
+esac
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -s|--session)    session="${2:?}"; shift 2 ;;
+    -u|--start-url)  start_url="${2:?}"; shift 2 ;;
+    -r|--sso-region) sso_region="${2:?}"; shift 2 ;;
+    --region)        profile_region="${2:?}"; shift 2 ;;
+    -p|--prefix)     prefix="${2:?}"; shift 2 ;;
+    --all-roles)     all_roles=1; shift ;;
+    --dry-run)       dry_run=1; shift ;;
+    --no-verify)     verify=0; shift ;;
+    -y|--yes)        assume_yes=1; shift ;;
+    -h|--help)       usage; exit 0 ;;
+    -V|--version)    echo "aws-oidc-login $VERSION"; exit 0 ;;
+    *)               usage >&2; die "unknown argument: $1" ;;
+  esac
+done
+
+"cmd_$command"

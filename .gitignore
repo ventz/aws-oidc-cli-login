@@ -1,0 +1,21 @@
+# Local / private
+CLAUDE.md
+CLAUDE.local.md
+.claude/
+.mcp.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+private/
+.private/
+sessions/
+.sessions/
+*.session
+.DS_Store
+
+# Never commit AWS state
+.aws/
+config.bak.*

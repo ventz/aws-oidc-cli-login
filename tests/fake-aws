@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Minimal stand-in for the AWS CLI, used by tests/run.sh. It answers only the
+# calls aws-oidc-login makes, from the fixture in $FAKE_AWS_FIXTURE.
+set -euo pipefail
+
+fixture="${FAKE_AWS_FIXTURE:?}"
+arg() {  # arg --flag: print the value following --flag
+  local want="$1"; shift
+  while [[ $# -gt 0 ]]; do [[ "$1" == "$want" ]] && { echo "$2"; return; }; shift; done
+}
+token_ok() { [[ "$(arg --access-token "$@")" == "fake-token" ]]; }
+
+case "${1:-} ${2:-}" in
+  "--version ")
+    echo "aws-cli/2.99.0 Python/3.12 test" ;;
+  "sso login")
+    s=$(arg --sso-session "$@")
+    mkdir -p "$HOME/.aws/sso/cache"
+    printf '{"accessToken":"fake-token"}' > "$HOME/.aws/sso/cache/$(printf '%s' "$s" | shasum | cut -d' ' -f1).json" ;;
+  "sso list-accounts")
+    token_ok "$@" || { echo "UnauthorizedException" >&2; exit 254; }
+    jq '{accountList: [.[] | {accountId: .id, accountName: .name}]}' "$fixture" ;;
+  "sso list-account-roles")
+    token_ok "$@" || { echo "UnauthorizedException" >&2; exit 254; }
+    jq --arg id "$(arg --account-id "$@")" \
+      '{roleList: [.[] | select(.id == $id) | .roles[] | {roleName: .}]}' "$fixture" ;;
+  "sts get-caller-identity")
+    p=$(arg --profile "$@")
+    acct=$(awk -v s="[profile $p]" '$0==s {f=1; next} /^\[/ {f=0} f && $1=="sso_account_id" {print $3}' "$AWS_CONFIG_FILE")
+    role=$(awk -v s="[profile $p]" '$0==s {f=1; next} /^\[/ {f=0} f && $1=="sso_role_name" {print $3}' "$AWS_CONFIG_FILE")
+    [[ -n "$acct" ]] || { echo "profile $p is not SSO" >&2; exit 255; }
+    echo "arn:aws:sts::$acct:assumed-role/AWSReservedSSO_${role}_0123abcd/tester@example.edu" ;;
+  *)
+    echo "fake-aws: unsupported call: $*" >&2; exit 2 ;;
+esac
