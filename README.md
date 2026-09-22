@@ -119,7 +119,7 @@ region = us-east-1
 ## Documentation
 
 - [How it works](docs/how-it-works.md): the login flow, what's cached where, lifetimes, and the security model
-- [Migrating from SAML tools](docs/migrating-from-saml.md): keeping profile names, credential precedence, and what the script renames and why
+- [Migrating from SAML tools](docs/migrating-from-saml.md): keeping profile names, custom aliases (converting a SAML role map), credential precedence, and what the script renames and why
 - [Using profiles with other tools](docs/using-with-tools.md): boto3, Terraform, CDK, Docker, and tools that only take environment variables
 - [Troubleshooting](docs/troubleshooting.md): common errors and fixes
 

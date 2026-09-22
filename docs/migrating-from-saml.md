@@ -37,11 +37,40 @@ You can delete the stale sections from `~/.aws/credentials` whenever you like, b
 | Temporary SAML keys (`ASIA…`) | Nothing: this is the case that's safe to reuse | Reuses the name |
 | A plain section (`region`, `output` only) | Nothing | Adds the `sso_*` keys to it |
 
-The script only reuses a name automatically when it matches the account's name after conversion (`Campus Services Dev` → `campus-services-dev`). If your SAML tool used different names (say `entarch` for `entarch-prod-standard`), you have two options:
-- Edit `~/.aws/config` by hand and add the `sso_*` keys under your old name.
-- Run the script first, then rename the section it created.
+## Keeping your own aliases
 
-Either way, later runs recognize that profile by its account and role and won't add a duplicate.
+SAML tools usually keep a separate role-mapping file (for example, the `profile_map` in `~/.huit_aws/config`). With Identity Center there is no separate mapping: **the profile name is the alias**. Name a profile anything you like, as long as it points at the same `sso_session`:
+
+```ini
+[profile my-alias]            # any name you want
+sso_session = huit
+sso_account_id = 111122223333
+sso_role_name = HUITReadOnly
+region = us-east-1
+```
+
+You can give one account and role several aliases (say `prod` and `fas-prod`). They all share the same login.
+
+**What changes: role names.** SAML mappings point at IAM role ARNs such as `arn:aws:iam::111122223333:role/myapp-prod-standard-saml-admin-iam-role`. Identity Center uses permission-set names like `HUITReadOnly`, `HUITPowerUser` or `HUITDevOpsAdmin` instead. Keep the account ID, but look up the new role name for each account:
+
+```bash
+aws-oidc-login list        # every account and the roles you have in it
+```
+
+**Convert an existing `profile_map`.** This prints one profile block per alias, with the alias, account ID and region carried over. You fill in each `sso_role_name` from `aws-oidc-login list`, check the output, and append it to `~/.aws/config`:
+
+```bash
+jq -r '.profile_map | to_entries[] |
+  (.key | capture("iam::(?<acct>[0-9]+):role/(?<role>[^@]+)@(?<region>.+)")) as $m |
+  "# was SAML role \($m.role)\n[profile \(.value)]\nsso_session = huit\nsso_account_id = \($m.acct)\nsso_role_name = CHANGE-ME\nregion = \($m.region)\n"' \
+  ~/.huit_aws/config
+```
+
+**Aliases and the script work together:**
+- Running `aws-oidc-login setup` after you've set up your aliases is safe. It recognizes a profile by its account and role, whatever it's named, and only adds profiles for accounts you haven't set up yet.
+- If you only want your own aliases, skip `setup`. `aws-oidc-login verify` still checks every profile that uses the session.
+- The script only reuses a name on its own when it matches the account's name after conversion (`Campus Services Dev` → `campus-services-dev`). For any other alias, add the `sso_*` keys by hand, or run `setup` and rename the section it created.
+- The rule from the table above still applies: if an alias holds a long-lived `AKIA…` key in `~/.aws/credentials`, give the SSO version a different name.
 
 ## Precedence cheat sheet
 
