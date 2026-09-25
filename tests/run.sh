@@ -131,6 +131,10 @@ check "conflicting start URL refused"    bash -c "! $test_bash '$root/bin/aws-oi
 new_env
 check "generate without login fails"     bash -c "! $test_bash '$root/bin/aws-oidc-login' generate 2>/dev/null"
 
+echo "versioning"
+latest=$(awk '/^## [0-9]/ {print $2; exit}' "$root/CHANGELOG.md")
+check "--version matches CHANGELOG"      test "$(tool --version)" = "aws-oidc-login $latest"
+
 rm -f "$fixture"
 echo
 echo "$pass passed, $fail failed"

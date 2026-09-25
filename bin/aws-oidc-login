@@ -5,7 +5,7 @@
 # Works with the macOS system bash (3.2) as well as bash 4/5.
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.0.2"
 
 # Defaults: Harvard University (HUIT) AWS access portal. Override with flags.
 DEFAULT_SESSION="huit"

@@ -122,6 +122,7 @@ region = us-east-1
 - [Migrating from SAML tools](docs/migrating-from-saml.md): keeping profile names, custom aliases (converting a SAML role map), credential precedence, and what the script renames and why
 - [Using profiles with other tools](docs/using-with-tools.md): boto3, Terraform, CDK, Docker, and tools that only take environment variables
 - [Troubleshooting](docs/troubleshooting.md): common errors and fixes
+- [Changelog](CHANGELOG.md): what changed in each version
 
 ## Contributing
 
@@ -132,6 +133,8 @@ tests/run.sh                    # your default bash
 TEST_BASH=/bin/bash tests/run.sh   # macOS system bash 3.2
 shellcheck bin/aws-oidc-login tests/*.sh tests/fake-aws
 ```
+
+Each push to `main` bumps the patch version in `bin/aws-oidc-login`, adds a [CHANGELOG](CHANGELOG.md) entry, and gets a matching `v1.0.N` tag. The tests check that the version and the changelog agree.
 
 This is a community tool, not an official HUIT service. For access to an account or role, ask that account's owner or HUIT Cloud Operations.
 
