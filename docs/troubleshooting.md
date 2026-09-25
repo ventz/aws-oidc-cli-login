@@ -18,6 +18,7 @@ aws sts get-caller-identity --profile X   # who you actually are
 | A profile still uses old SAML keys | Its `config` section has no `sso_*` keys (typo in the name, or `[name]` instead of `[profile name]`) | `aws configure list --profile X` should show TYPE `sso` |
 | An account you expected is missing | Not assigned to you in the portal | Ask the account owner; SAML-only accounts stay on your old tool |
 | A tool can't find credentials but the CLI can | The tool's SDK predates `sso-session` | Upgrade the tool, or see [using-with-tools.md](using-with-tools.md) |
+| `aws-oidc-login: could not list the roles for every account` | A `ListAccountRoles` call failed; the AWS error is printed above it (for example `ThrottlingException` if other tools are calling Identity Center at the same time) | Run the command again |
 | `aws-oidc-login: not logged in` right after using the CLI | The cached access token expired (~1 h) and there's no SSO profile yet to refresh it through | `aws-oidc-login login` |
 
 ## Undo

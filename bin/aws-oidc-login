@@ -16,6 +16,7 @@ DEFAULT_ROLE_PREFERENCE="HUITDevOpsAdmin,HUITGenAdmin,HUITPowerUser,HUITReadOnly
 CONFIG="${AWS_CONFIG_FILE:-$HOME/.aws/config}"
 CREDENTIALS="${AWS_SHARED_CREDENTIALS_FILE:-$HOME/.aws/credentials}"
 CACHE_DIR="$HOME/.aws/sso/cache"
+PARALLEL=16  # concurrent list-account-roles calls; see docs/how-it-works.md
 
 session="$DEFAULT_SESSION"
 start_url=""
@@ -154,10 +155,19 @@ access_token() {
   [[ -f "$f" ]] && jq -r '.accessToken // empty' "$f" 2>/dev/null || true
 }
 
+# account_id <TAB> account_name, sorted by name. Filled by token_works, which
+# needs one list-accounts call anyway, so account_roles can reuse it.
+accounts=""
+
+list_accounts() {
+  aws sso list-accounts --access-token "$1" --region "$sso_region" --output json \
+    | jq -r '.accountList[] | [.accountId, .accountName] | @tsv' \
+    | sort -t "$(printf '\t')" -k2 -f
+}
+
 token_works() {
   local t; t=$(access_token)
-  [[ -n "$t" ]] && aws sso list-accounts --access-token "$t" --region "$sso_region" \
-                     --max-items 1 >/dev/null 2>&1
+  [[ -n "$t" ]] && accounts=$(list_accounts "$t" 2>/dev/null)
 }
 
 # The cached access token lasts about an hour; the CLI refreshes it silently
@@ -185,15 +195,26 @@ ensure_token() {
 
 # rows: account_id <TAB> account_name <TAB> role   (one row per role)
 account_roles() {
-  local t; t=$(access_token)
-  aws sso list-accounts --access-token "$t" --region "$sso_region" --output json \
-    | jq -r '.accountList[] | [.accountId, .accountName] | @tsv' \
-    | sort -t "$(printf '\t')" -k2 -f \
-    | while IFS="$(printf '\t')" read -r id name; do
-        aws sso list-account-roles --access-token "$t" --region "$sso_region" \
-            --account-id "$id" --output json \
-          | jq -r --arg id "$id" --arg n "$name" '.roleList[] | [$id, $n, .roleName] | @tsv'
-      done
+  local t accts dir rc=0
+  t=$(access_token)
+  accts="$accounts"
+  [[ -n "$accts" ]] || accts=$(list_accounts "$t")
+  [[ -n "$accts" ]] || return 0
+  # One CLI call per account; run them in parallel (each costs ~0.7s of CLI
+  # startup and a round trip), then print in account-name order.
+  dir=$(mktemp -d "${TMPDIR:-/tmp}/aws-oidc-login.XXXXXX")
+  # shellcheck disable=SC2016  # expanded by the inner sh, not here
+  printf '%s\n' "$accts" | cut -f1 \
+    | SSO_TOKEN="$t" SSO_REGION="$sso_region" OUT="$dir" xargs -n1 -P "$PARALLEL" sh -c \
+        'aws sso list-account-roles --access-token "$SSO_TOKEN" --region "$SSO_REGION" \
+           --account-id "$1" --output json > "$OUT/$1.json"' _ || rc=$?
+  if (( rc == 0 )); then
+    printf '%s\n' "$accts" | while IFS="$(printf '\t')" read -r id name; do
+      jq -r --arg id "$id" --arg n "$name" '.roleList | sort_by(.roleName)[] | [$id, $n, .roleName] | @tsv' "$dir/$id.json"
+    done || rc=$?
+  fi
+  rm -rf "$dir"
+  (( rc == 0 )) || die "could not list the roles for every account"
 }
 
 pick_role() {  # stdin: role names; prints the preferred one

@@ -41,7 +41,7 @@ Automatic refresh needs the `sso-session` format with the `sso:account:access` s
 
 1. Adds `[sso-session huit]` if it's missing (after backing up the config).
 2. Reuses a valid token, refreshes an expired one through an existing profile, or opens the browser to log in.
-3. Lists every account and role (`sso:ListAccounts`, `sso:ListAccountRoles`).
+3. Lists every account and role (`sso:ListAccounts`, `sso:ListAccountRoles`). There's one `ListAccountRoles` call per account, and up to 16 run at once. Identity Center allows 20 requests per second, and the AWS CLI retries automatically if a request is throttled. `list` and `generate` look up accounts the same way.
 4. Plans one profile per account. Each is marked **add**, **merge** (add `sso_*` keys to an existing plain section), **exists** (already set up, under any name), or renamed with a `-sso` suffix (the name belongs to a long-lived key, an assume-role profile or another account).
 5. Shows the plan, backs up `~/.aws/config`, and applies the plan once you confirm.
 6. Runs `sts get-caller-identity` against every profile in the session.
